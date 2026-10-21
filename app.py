@@ -2,11 +2,11 @@
 import os
 import hashlib
 import time
+import requests
 
 import pymupdf
 import streamlit as st
 from dotenv import load_dotenv
-from google import genai
 
 from paperpilot.embeddings import create_embeddings
 from paperpilot.database import collection
@@ -21,15 +21,6 @@ st.set_page_config(
     page_icon="📚",
     layout="wide"
 )
-
-api_key = os.getenv("GEMINI_API_KEY")
-
-if not api_key:
-    st.error("GEMINI_API_KEY is missing. Check your .env file.")
-    st.stop()
-
-client = genai.Client(api_key=api_key)
-
 st.title("📚 PaperPilot")
 st.caption("Your AI research assistant — ask questions about your papers.")
 
@@ -143,120 +134,6 @@ def get_paper_library():
 
     return library
 
-# ---------- RETRIEVAL ----------
-
-def prepare_question(question, paper_id):
-    total_start = time.perf_counter()
-
-    start = time.perf_counter()
-    query_embedding = create_embeddings([question])
-    embedding_time = time.perf_counter() - start
-
-    start = time.perf_counter()
-
-    # Restrict retrieval to the selected paper
-    paper_count = collection.get(
-        where={"paper_id": paper_id},
-        limit=1
-    )
-
-    if not paper_count["ids"]:
-        return None, {
-            "embedding": embedding_time,
-            "search": 0.0,
-            "total": time.perf_counter() - total_start
-        }
-
-    results = collection.query(
-        query_embeddings=query_embedding.tolist(),
-        n_results=3,
-        where={"paper_id": paper_id},
-        include=["documents", "metadatas"]
-    )
-
-    search_time = time.perf_counter() - start
-
-    documents = results["documents"][0]
-    metadatas = results["metadatas"][0]
-
-    if not documents:
-        return None, {
-            "embedding": embedding_time,
-            "search": search_time,
-            "total": time.perf_counter() - total_start
-        }
-
-    context_parts = []
-
-    for text, metadata in zip(documents, metadatas):
-        context_parts.append(
-            f"[PDF page {metadata['page']}]\n{text}"
-        )
-
-    context = "\n\n".join(context_parts)
-
-    prompt = f"""
-You are PaperPilot, a research paper assistant.
-
-Answer using ONLY the provided paper excerpts.
-Do not invent facts.
-Cite supporting pages using [PDF page N].
-Keep the answer concise, under 120 words.
-If the excerpts do not contain the answer, say so clearly.
-
-PAPER EXCERPTS:
-{context}
-
-QUESTION:
-{question}
-"""
-
-    return prompt, {
-        "embedding": embedding_time,
-        "search": search_time,
-        "total": time.perf_counter() - total_start
-    }
-
-
-# ---------- GEMINI STREAMING ----------
-
-def stream_answer(prompt, timings):
-    start = time.perf_counter()
-    first_text_time = None
-
-    try:
-        stream = client.models.generate_content_stream(
-            model="gemini-3.6-flash",
-            contents=prompt
-        )
-
-        for chunk in stream:
-            if chunk.text:
-                if first_text_time is None:
-                    first_text_time = time.perf_counter() - start
-
-                yield chunk.text
-
-    finally:
-        gemini_time = time.perf_counter() - start
-
-        print("\n--- PaperPilot performance ---")
-        print(f"Question embedding: {timings['embedding']:.2f} seconds")
-        print(f"ChromaDB search:    {timings['search']:.2f} seconds")
-        print(
-            f"First text received: {first_text_time:.2f} seconds"
-            if first_text_time is not None
-            else "First text received: No text"
-        )
-        print(f"Gemini generation:  {gemini_time:.2f} seconds")
-        print(
-            f"Total: {timings['total'] + gemini_time:.2f} seconds"
-        )
-        print("------------------------------\n")
-
-
-# ---------- USER INTERFACE ----------
-
 # ---------- USER INTERFACE ----------
 
 st.subheader("📚 My Research Library")
@@ -353,34 +230,50 @@ else:
         with st.chat_message("user"):
             st.markdown(question)
 
+
         with st.chat_message("assistant"):
             try:
-                with st.spinner("Finding relevant passages..."):
-                    prompt, timings = prepare_question(
-                        question,
-                        selected_id
+                with st.spinner("Finding relevant passages and generating answer..."):
+                    response = requests.post(
+                        "http://127.0.0.1:8000/ask",
+                        json={
+                            "question": question,
+                            "paper_id": selected_id
+                        },
+                        timeout=180
                     )
 
-                if prompt is None:
-                    answer = (
-                        "I couldn't find relevant passages in this paper."
-                    )
+                if response.status_code == 200:
+                    data = response.json()
+                    answer = data.get("answer") or "No answer was returned."
                     st.markdown(answer)
 
-                else:
-                    answer = st.write_stream(
-                        stream_answer(prompt, timings)
-                    )
+                   
+                  
 
-                    if not answer:
-                        answer = "No answer was returned."
-                        st.markdown(answer)
+                    
+                else:
+                    try:
+                        detail = response.json().get(
+                            "detail", response.text
+                        )
+                    except ValueError:
+                        detail = response.text
+
+                    answer = f"API error ({response.status_code}): {detail}"
+                    st.error(answer)
 
                 history.append({
                     "role": "assistant",
                     "content": answer
                 })
 
-            except Exception as error:
-                st.error(f"Something went wrong: {error}")
+            except requests.RequestException as error:
+                st.error(
+                    "Could not connect to FastAPI at "
+                    "http://127.0.0.1:8000. "
+                    "Make sure the API server is running. "
+                    f"Details: {error}"
+                )
+
 
